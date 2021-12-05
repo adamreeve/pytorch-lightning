@@ -136,7 +136,7 @@ class StochasticWeightAveraging(Callback):
         self._swa_scheduler: Optional[SWALR] = None
         self._scheduler_step_count: Optional[int] = None
         self._init_n_averaged = 0
-        self.momenta: Optional[Dict[nn.modules.batchnorm._BatchNorm, float]] = None
+        self._batch_norm_moments = None
 
     @property
     def swa_start(self) -> int:
@@ -177,9 +177,6 @@ class StochasticWeightAveraging(Callback):
         self._model_contains_batch_norm = self.pl_module_contains_batch_norm(pl_module)
 
         self._max_epochs = trainer.max_epochs
-        if self._model_contains_batch_norm:
-            # virtually increase max_epochs to perform batch norm update on latest epoch.
-            trainer.fit_loop.max_epochs += 1
 
     def on_train_epoch_start(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule"):
         if (not self._initialized) and (self.swa_start <= trainer.current_epoch <= self.swa_end):
@@ -231,36 +228,12 @@ class StochasticWeightAveraging(Callback):
         if self.swa_start <= trainer.current_epoch <= self.swa_end:
             self.update_parameters(self._average_model, pl_module, self.n_averaged, self.avg_fn)
 
-        # Note: No > here in case the callback is saved with the model and training continues
-        if trainer.current_epoch == self.swa_end + 1:
-            # Transfer weights from average model to pl_module
-            self.transfer_weights(self._average_model, pl_module)
-
-            # Reset BatchNorm for update
-            self.reset_batch_norm_and_save_state(pl_module)
-
-            # There is no need to perform either backward or optimizer.step as we are
-            # performing only one pass over the train data-loader to compute activation statistics
-            # Therefore, we will virtually increase `num_training_batches` by 1 and skip backward.
-            trainer.num_training_batches += 1
-            trainer.fit_loop._skip_backward = True
-            self._accumulate_grad_batches = trainer.accumulate_grad_batches
-
-            trainer.accumulate_grad_batches = trainer.num_training_batches
-
-    def on_train_epoch_end(self, trainer: "pl.Trainer", *args):
-        trainer.fit_loop._skip_backward = False
-
     def on_train_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule"):
-        if self._model_contains_batch_norm and trainer.current_epoch == self.swa_end + 1:
-            # BatchNorm epoch update. Reset state
-            trainer.accumulate_grad_batches = self._accumulate_grad_batches
-            trainer.num_training_batches -= 1
-            trainer.fit_loop.max_epochs -= 1
-            self.reset_momenta()
-        elif trainer.current_epoch == self.swa_end:
+        if trainer.current_epoch == self.swa_end:
             # Last SWA epoch. Transfer weights from average model to pl_module
             self.transfer_weights(self._average_model, pl_module)
+            if self._model_contains_batch_norm:
+                self._update_batch_norm_moments(trainer, pl_module, store_moments=False)
 
     def on_validation_start(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
         if self._swa_validation and (self.swa_start <= trainer.current_epoch <= self.swa_end):
@@ -268,37 +241,66 @@ class StochasticWeightAveraging(Callback):
             self.transfer_weights(pl_module, self._temp_model)
             # Update the model with the averaged parameters
             self.transfer_weights(self._average_model, pl_module)
+            if self._model_contains_batch_norm:
+                self._update_batch_norm_moments(trainer, pl_module)
 
     def on_validation_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
         if self._swa_validation and (self.swa_start <= trainer.current_epoch <= self.swa_end):
             # Copy original model parameters back
             self.transfer_weights(self._temp_model, pl_module)
+            if self._model_contains_batch_norm:
+                self._restore_batch_norm_moments()
 
     @staticmethod
     def transfer_weights(src_pl_module: "pl.LightningModule", dst_pl_module: "pl.LightningModule"):
         for src_param, dst_param in zip(src_pl_module.parameters(), dst_pl_module.parameters()):
             dst_param.detach().copy_(src_param.to(dst_param.device))
 
-    def reset_batch_norm_and_save_state(self, pl_module: "pl.LightningModule"):
+    def _update_batch_norm_moments(
+        self, trainer: "pl.Trainer", pl_module: "pl.LightningModule", store_moments: bool = True
+    ):
         """Adapted from https://github.com/pytorch/pytorch/blob/v1.7.1/torch/optim/swa_utils.py#L140-L154."""
-        self.momenta = {}
+        prev_momenta = {}
+        self._batch_norm_moments = {}
+
+        train_data_fetcher = trainer.data_connector.train_data_fetcher
+
+        if train_data_fetcher is None:
+            # Training data not yet connected, could be in a validation sanity check
+            return
+
+        was_training = pl_module.training
+        pl_module.train()
+
         for module in pl_module.modules():
             if not isinstance(module, nn.modules.batchnorm._BatchNorm):
                 continue
+            prev_momenta[module] = module.momentum
+            if store_moments:
+                self._batch_norm_moments[module] = (module.running_mean, module.running_var)
             module.running_mean = torch.zeros_like(
                 module.running_mean, device=pl_module.device, dtype=module.running_mean.dtype
             )
             module.running_var = torch.ones_like(
                 module.running_var, device=pl_module.device, dtype=module.running_var.dtype
             )
-            self.momenta[module] = module.momentum
             module.momentum = None
             module.num_batches_tracked *= 0
 
-    def reset_momenta(self):
-        """Adapted from https://github.com/pytorch/pytorch/blob/v1.7.1/torch/optim/swa_utils.py#L164-L165."""
-        for bn_module in self.momenta:
-            bn_module.momentum = self.momenta[bn_module]
+        # Recompute mean and variance for all batch norm layers by doing a full pass over the training data
+        for batch, _ in train_data_fetcher:
+            batch = batch.to(pl_module.device)
+            pl_module(batch)
+
+        # Reset model state
+        for bn_module, momenta in prev_momenta.items():
+            bn_module.momentum = momenta
+        pl_module.train(was_training)
+
+    def _restore_batch_norm_moments(self):
+        for bn_module, (mean, variance) in self._batch_norm_moments.items():
+            bn_module.running_mean = mean
+            bn_module.running_var = variance
 
     @staticmethod
     def update_parameters(
