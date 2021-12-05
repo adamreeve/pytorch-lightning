@@ -24,7 +24,8 @@ from torch.optim.swa_utils import SWALR
 from torch.utils.data import DataLoader
 
 from pytorch_lightning import LightningModule, Trainer
-from pytorch_lightning.callbacks import StochasticWeightAveraging
+from pytorch_lightning.callbacks import ModelCheckpoint, StochasticWeightAveraging
+from pytorch_lightning.core.datamodule import LightningDataModule
 from pytorch_lightning.plugins import DDPSpawnPlugin
 from pytorch_lightning.plugins.training_type import TrainingTypePlugin
 from pytorch_lightning.utilities.exceptions import MisconfigurationException
@@ -56,6 +57,7 @@ class SwaTestModel(BoringModel):
     def validation_step(self, batch, batch_idx):
         output = self.forward(batch)
         loss = self.loss(batch, output)
+        self.log("val_loss", loss)
         return {"x": loss}
 
     def train_dataloader(self):
@@ -139,9 +141,29 @@ class SwaTestCallback(StochasticWeightAveraging):
         assert self.update_parameters_calls == trainer.max_epochs - first_swa_epoch
         if self._swa_validation:
             # 3 weight transfers are needed per SWA validation step
-            assert self.transfer_weights_calls == (self.validation_calls - self._swa_epoch_start) * 3 + 1
+            assert self.transfer_weights_calls == (self.validation_calls - self.swa_start) * 3 + 1
         else:
             assert self.transfer_weights_calls == 1
+
+
+class SwaTestDataModule(LightningDataModule):
+    """Shim data module that just wraps a model."""
+
+    def __init__(self, model: LightningModule):
+        super().__init__()
+        self._model = model
+
+    def train_dataloader(self):
+        return self._model.train_dataloader()
+
+    def test_dataloader(self):
+        return self._model.test_dataloader()
+
+    def predict_dataloader(self):
+        return self._model.predict_dataloader()
+
+    def val_dataloader(self):
+        return self._model.val_dataloader()
 
 
 def train_with_swa(
@@ -166,7 +188,8 @@ def train_with_swa(
         enable_progress_bar=False,
         max_epochs=max_epochs,
         limit_train_batches=5,
-        limit_val_batches=1.0 if validation else 0.0,
+        limit_val_batches=5 if validation else 0,
+        num_sanity_val_steps=0,
         callbacks=[swa_callback],
         accumulate_grad_batches=2,
         strategy=strategy,
@@ -407,3 +430,45 @@ def test_misconfiguration_error_with_ddp_fully_sharded(tmpdir):
 @RunIf(deepspeed=True)
 def test_misconfiguration_error_with_deep_speed(tmpdir):
     _test_misconfiguration_error_with_sharded_model(tmpdir, "deepspeed")
+
+
+@pytest.mark.parametrize("batchnorm", (True, False))
+@pytest.mark.parametrize("within_swa_epochs", (True, False))
+@pytest.mark.parametrize("use_datamodule", (True, False))
+def test_swa_load_best_checkpoint(tmpdir, batchnorm: bool, within_swa_epochs: bool, use_datamodule: bool):
+    model = SwaTestModel(batchnorm=batchnorm)
+    if within_swa_epochs:
+        # Start at epoch 1, so we can guarantee the best checkpoint should be saved with SWA weights
+        swa_start = 1
+    else:
+        # Start after the last epoch, so we never save a checkpoint with SWA parameters
+        swa_start = 6
+    max_epochs = 5
+
+    swa_callback = SwaTestCallback(swa_epoch_start=swa_start, swa_lrs=0.1, swa_validation=True)
+    checkpoint_callback = ModelCheckpoint(monitor="val_loss", save_top_k=3, mode="min")
+
+    trainer = Trainer(
+        default_root_dir=tmpdir,
+        enable_progress_bar=False,
+        max_epochs=max_epochs,
+        limit_train_batches=5,
+        limit_val_batches=5,
+        num_sanity_val_steps=0,
+        callbacks=[swa_callback, checkpoint_callback],
+        accumulate_grad_batches=2,
+        num_processes=1,
+    )
+
+    with mock.patch.object(TrainingTypePlugin, "backward", wraps=trainer.training_type_plugin.backward):
+        trainer.fit(model)
+
+    datamodule = SwaTestDataModule(model) if use_datamodule else None
+
+    checkpoint_path = checkpoint_callback.best_model_path
+    new_model = SwaTestModel.load_from_checkpoint(checkpoint_path)
+    parameters_loaded = SwaTestCallback.restore_average_parameters_from_checkpoint(
+        new_model, checkpoint_path, datamodule=datamodule
+    )
+
+    assert parameters_loaded == within_swa_epochs
