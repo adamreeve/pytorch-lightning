@@ -16,7 +16,7 @@ Stochastic Weight Averaging Callback
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 """
 from copy import deepcopy
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, IO, List, Optional, Type, Union
 
 import torch
 from torch import nn
@@ -27,6 +27,7 @@ from pytorch_lightning.callbacks.base import Callback
 from pytorch_lightning.plugins.training_type import DDPFullyShardedPlugin, DeepSpeedPlugin
 from pytorch_lightning.trainer.optimizers import _get_default_scheduler_config
 from pytorch_lightning.utilities import rank_zero_info, rank_zero_warn
+from pytorch_lightning.utilities.cloud_io import load as pl_load
 from pytorch_lightning.utilities.exceptions import MisconfigurationException
 
 _AVG_FN = Callable[[torch.Tensor, torch.Tensor, torch.LongTensor], torch.FloatTensor]
@@ -334,6 +335,52 @@ class StochasticWeightAveraging(Callback):
         self._init_n_averaged = callback_state["n_averaged"]
         self._scheduler_step_count = callback_state["scheduler_step_count"]
         self._load_average_model_parameters(callback_state["average_model_parameters"])
+
+    @classmethod
+    def restore_average_parameters_from_checkpoint(
+        cls,
+        pl_module: "pl.LightningModule",
+        checkpoint_path: Union[str, IO],
+        map_location: Optional[Union[Dict[str, str], str, torch.device, int, Callable]] = None,
+    ) -> bool:
+        r"""
+        Set model weights to the SWA averaged weights saved in a checkpoint.
+
+        Arguments:
+            pl_module: The module to set weights on
+            checkpoint_path: Path to checkpoint. This can also be a URL, or file-like object
+            map_location:
+                If your checkpoint saved a GPU model and you now load on CPUs
+                or a different number of GPUs, use this to map to the new setup.
+                The behaviour is the same as in :func:`torch.load`.
+
+        Return:
+            A `bool` indicating whether averaged weights were loaded. If `False`, this means the checkpoint is
+                from an epoch before the SWA epoch start.
+        """
+        if map_location is not None:
+            checkpoint = pl_load(checkpoint_path, map_location=map_location)
+        else:
+            checkpoint = pl_load(checkpoint_path, map_location=lambda storage, loc: storage)
+        callback_states: Dict[Union[Type, str], Dict] = checkpoint.get("callbacks")
+        if not callback_states:
+            raise ValueError("callback states are not present in the checkpoint")
+
+        state_key = cls.__qualname__  # Default state key defined in Callback base class
+        state = callback_states.get(state_key)
+        if not state:
+            raise ValueError(f"no {state_key} state found in the checkpoint")
+        state = deepcopy(state)
+        average_model_parameters = state["average_model_parameters"]
+
+        if not average_model_parameters:
+            return False
+
+        for p_model, p_swa in zip(pl_module.parameters(), average_model_parameters):
+            device = p_model.device
+            p_swa_ = p_swa.detach().to(device)
+            p_model.detach().copy_(p_swa_)
+        return True
 
     def _get_average_model_parameters(self, trainer: "pl.Trainer") -> Optional[List[nn.Parameter]]:
         if self._average_model is None or not (self.swa_start <= trainer.current_epoch <= self.swa_end):
