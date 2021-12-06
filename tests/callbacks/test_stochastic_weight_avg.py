@@ -14,7 +14,7 @@
 import logging
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 from unittest import mock
 
 import pytest
@@ -89,23 +89,34 @@ class SwaTestModel(BoringModel):
 
 
 class SwaTestCallback(StochasticWeightAveraging):
-    validation_calls: int = 0
-    update_parameters_calls: int = 0
-    transfer_weights_calls: int = 0
-    # Record the first epoch, as if we are resuming from a checkpoint this may not be equal to 0
-    first_epoch: Optional[int] = None
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.validation_calls: int = 0
+        self.update_parameters_calls: int = 0
+        self.transfer_weights_calls: int = 0
+        self.weight_source_map: Dict[LightningModule, LightningModule] = {}
+        # Record the first epoch, as if we are resuming from a checkpoint this may not be equal to 0
+        self.first_epoch: Optional[int] = None
 
     def update_parameters(self, *args, **kwargs):
         self.update_parameters_calls += 1
         return StochasticWeightAveraging.update_parameters(*args, **kwargs)
 
-    def on_validation_start(self, *args, **kwargs):
+    def on_validation_start(self, trainer: Trainer, pl_module: LightningModule):
         self.validation_calls += 1
-        return super().on_validation_start(*args, **kwargs)
+        super().on_validation_start(trainer, pl_module)
+        within_swa_epoch = self.swa_start <= trainer.current_epoch <= self.swa_end
+        self._verify_swa_weights_used(pl_module, self._swa_validation and within_swa_epoch)
 
-    def transfer_weights(self, *args, **kwargs):
+    def on_validation_end(self, trainer: Trainer, pl_module: LightningModule):
+        super().on_validation_end(trainer, pl_module)
+        self._verify_swa_weights_used(pl_module, False)
+
+    def transfer_weights(self, src_pl_module: LightningModule, dst_pl_module: LightningModule):
         self.transfer_weights_calls += 1
-        return StochasticWeightAveraging.transfer_weights(*args, **kwargs)
+        # Track where module weights have been transferred from so that we can verify whether we are using SWA weights
+        self.weight_source_map[dst_pl_module] = self.weight_source_map.get(src_pl_module, src_pl_module)
+        return StochasticWeightAveraging.transfer_weights(src_pl_module, dst_pl_module)
 
     def on_train_epoch_start(self, trainer, *args):
         super().on_train_epoch_start(trainer, *args)
@@ -144,6 +155,18 @@ class SwaTestCallback(StochasticWeightAveraging):
             assert self.transfer_weights_calls == (self.validation_calls - self.swa_start) * 3 + 1
         else:
             assert self.transfer_weights_calls == 1
+
+        # check average parameters have been transferred
+        self._verify_swa_weights_used(pl_module, True)
+
+    def _verify_swa_weights_used(self, pl_module: LightningModule, expect_weights_used: bool):
+        """Test whether the provided module is using SWA parameters."""
+        if expect_weights_used:
+            # Weights should originate from the averaged model
+            assert self.weight_source_map.get(pl_module) is self._average_model
+        else:
+            # Weights should originate from the module itself
+            assert self.weight_source_map.get(pl_module, pl_module) is pl_module
 
 
 class SwaTestDataModule(LightningDataModule):
