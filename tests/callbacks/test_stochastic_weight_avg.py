@@ -107,6 +107,11 @@ class SwaTestCallback(StochasticWeightAveraging):
         super().on_validation_start(trainer, pl_module)
         within_swa_epoch = self.swa_start <= trainer.current_epoch <= self.swa_end
         self._verify_swa_weights_used(pl_module, self._swa_validation and within_swa_epoch)
+        if within_swa_epoch:
+            # Either swa_validation is disabled and batch norm batch counts should not be zeroed
+            # as weights aren't transferred, or the batch norm update should have been applied.
+            expect_bn_update = self._validation_batch_norm_update or not self._swa_validation
+            self._verify_batch_norm_updated(pl_module, expect_bn_update)
 
     def on_validation_end(self, trainer: Trainer, pl_module: LightningModule):
         super().on_validation_end(trainer, pl_module)
@@ -116,6 +121,9 @@ class SwaTestCallback(StochasticWeightAveraging):
         self.transfer_weights_calls += 1
         # Track where module weights have been transferred from so that we can verify whether we are using SWA weights
         self.weight_source_map[dst_pl_module] = self.weight_source_map.get(src_pl_module, src_pl_module)
+        # After transferring weights, batch norm moments are no longer up to date. We reset the batch norm batch count
+        # to zero so that we can later test whether the batch norm parameters have been updated.
+        self._zero_batch_norm_batch_count(dst_pl_module)
         return StochasticWeightAveraging.transfer_weights(src_pl_module, dst_pl_module)
 
     def on_train_epoch_start(self, trainer, *args):
@@ -158,6 +166,7 @@ class SwaTestCallback(StochasticWeightAveraging):
 
         # check average parameters have been transferred
         self._verify_swa_weights_used(pl_module, True)
+        self._verify_batch_norm_updated(pl_module)
 
     def _verify_swa_weights_used(self, pl_module: LightningModule, expect_weights_used: bool):
         """Test whether the provided module is using SWA parameters."""
@@ -167,6 +176,21 @@ class SwaTestCallback(StochasticWeightAveraging):
         else:
             # Weights should originate from the module itself
             assert self.weight_source_map.get(pl_module, pl_module) is pl_module
+
+    @staticmethod
+    def _zero_batch_norm_batch_count(pl_module: LightningModule):
+        for module in pl_module.modules():
+            if isinstance(module, nn.modules.batchnorm._BatchNorm):
+                module.num_batches_tracked *= 0
+
+    @staticmethod
+    def _verify_batch_norm_updated(pl_module: LightningModule, expect_updated: bool = True):
+        for module in pl_module.modules():
+            if isinstance(module, nn.modules.batchnorm._BatchNorm):
+                if expect_updated:
+                    assert module.num_batches_tracked.item() > 0
+                else:
+                    assert module.num_batches_tracked.item() == 0
 
 
 class SwaTestDataModule(LightningDataModule):
@@ -198,11 +222,17 @@ def train_with_swa(
     interval="epoch",
     iterable_dataset=False,
     validation=False,
+    validation_batchnorm_update=True,
 ):
     model = SwaTestModel(batchnorm=batchnorm, interval=interval, iterable_dataset=iterable_dataset)
     swa_start = 2
     max_epochs = 5
-    swa_callback = SwaTestCallback(swa_epoch_start=swa_start, swa_lrs=0.1, swa_validation=validation)
+    swa_callback = SwaTestCallback(
+        swa_epoch_start=swa_start,
+        swa_lrs=0.1,
+        swa_validation=validation,
+        validation_batch_norm_update=validation_batchnorm_update,
+    )
     assert swa_callback.update_parameters_calls == 0
     assert swa_callback.transfer_weights_calls == 0
 
@@ -211,7 +241,7 @@ def train_with_swa(
         enable_progress_bar=False,
         max_epochs=max_epochs,
         limit_train_batches=5,
-        limit_val_batches=5 if validation else 0,
+        limit_val_batches=5,
         num_sanity_val_steps=0,
         callbacks=[swa_callback],
         accumulate_grad_batches=2,
@@ -252,6 +282,11 @@ def test_swa_callback_1_gpu(tmpdir):
 @pytest.mark.parametrize("validation", (True, False))
 def test_swa_callback(tmpdir, batchnorm: bool, iterable_dataset: bool, validation: bool):
     train_with_swa(tmpdir, batchnorm=batchnorm, iterable_dataset=iterable_dataset, validation=validation)
+
+
+@pytest.mark.parametrize("validation", (True, False))
+def test_swa_callback_without_validation_batchnorm_update(tmpdir, validation):
+    train_with_swa(tmpdir, batchnorm=True, validation=validation, validation_batchnorm_update=False)
 
 
 @pytest.mark.parametrize("interval", ("epoch", "step"))

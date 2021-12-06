@@ -46,6 +46,7 @@ class StochasticWeightAveraging(Callback):
         avg_fn: Optional[_AVG_FN] = None,
         device: Optional[Union[torch.device, str]] = torch.device("cpu"),
         swa_validation: bool = False,
+        validation_batch_norm_update: bool = True,
     ):
         r"""
 
@@ -102,6 +103,12 @@ class StochasticWeightAveraging(Callback):
             swa_validation: if True, then the averaged model weights are used during validation
                 (default: ``False``)
 
+            validation_batch_norm_update: if True and ``swa_validation`` is True,
+                then batch normalisation parameters are updated before validation, after model weights
+                are set to the SWA weights.
+                Note that this requires a full pass over the training data so may be expensive.
+                This parameter has no effect when ``swa_validation`` is False. (default: ``True``)
+
         """
 
         err_msg = "swa_epoch_start should be a >0 integer or a float between 0 and 1."
@@ -131,6 +138,7 @@ class StochasticWeightAveraging(Callback):
         self._annealing_strategy = annealing_strategy
         self._avg_fn = avg_fn or self.avg_fn
         self._swa_validation = swa_validation
+        self._validation_batch_norm_update = validation_batch_norm_update
         self._device = device
         self._model_contains_batch_norm: Optional[bool] = None
         self._average_model: Optional[pl.LightningModule] = None
@@ -244,14 +252,14 @@ class StochasticWeightAveraging(Callback):
             self.transfer_weights(pl_module, self._temp_model)
             # Update the model with the averaged parameters
             self.transfer_weights(self._average_model, pl_module)
-            if self._model_contains_batch_norm:
+            if self._model_contains_batch_norm and self._validation_batch_norm_update:
                 self._update_batch_norm_moments(trainer, pl_module)
 
     def on_validation_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
         if self._swa_validation and (self.swa_start <= trainer.current_epoch <= self.swa_end):
             # Copy original model parameters back
             self.transfer_weights(self._temp_model, pl_module)
-            if self._model_contains_batch_norm:
+            if self._model_contains_batch_norm and self._validation_batch_norm_update:
                 self._restore_batch_norm_moments()
 
     @staticmethod
